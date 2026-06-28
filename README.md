@@ -1,4 +1,4 @@
-# AlphaSignal — AI Investment Research Agent
+# NexusAI — AI Investment Research Agent
 
 > Institutional-grade AI investment research powered by LangGraph.js multi-agent orchestration.
 
@@ -6,7 +6,7 @@
 
 ## Overview
 
-**AlphaSignal** is a full-stack AI investment research agent that:
+**NexusAI** is a full-stack AI investment research agent that:
 1. Accepts any public company name or ticker
 2. Runs a **multi-agent LangGraph pipeline** to research it from multiple angles
 3. Delivers a structured **INVEST / PASS / WATCH** verdict with reasoning
@@ -20,6 +20,11 @@ The agent performs:
 - **Decision synthesis** — CIO-level verdict with bull/bear case and score breakdown
 
 Results stream **live via SSE** so you watch the agent think in real-time.
+
+---
+
+## Vercel - https://ai-investment-research.vercel.app/
+## Github - https://github.com/anshjaiswal11/AI-Investment-Research
 
 ---
 
