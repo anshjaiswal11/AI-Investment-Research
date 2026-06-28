@@ -1,16 +1,11 @@
 /**
- * nodes.ts — Optimised for speed on free-tier OpenRouter models.
+ * nodes.ts
  *
- * Architecture change (6 LLM calls → 3):
- *  1. companyResolverNode  — 1 Tavily search  + 1 LLM call
- *  2. combinedResearchNode — 1 Tavily search  + 2 Alpha Vantage calls (parallel REST) + 1 LLM call
- *                            returns: financialMetrics + newsAnalysis + moatAnalysis + riskAssessment
- *  3. decisionMakerNode    — 0 extra searches + 1 LLM call
- *
- * Data fetches inside each node run in parallel (Promise.all) — no extra time cost.
- * LLM calls are sequential to avoid 429s on the free tier.
+ * Pipeline: 4 LLM calls (resolver → financials+news → moat+risk → decision)
+ * - Each call has a 180s timeout (needed for the 550B free-tier model)
+ * - No silent fallbacks for core research — if AI can't respond, we fail clearly
+ * - All external data fetches (Alpha Vantage, Tavily) run in parallel
  */
-
 import { ChatOpenAI } from "@langchain/openai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { searchWeb, getCompanyOverview, getStockQuote } from "./tools";
@@ -27,12 +22,14 @@ import type {
 
 // ─── LLM ──────────────────────────────────────────────────────────────────────
 
+const MODEL = process.env.OPENROUTER_MODEL ?? "nvidia/nemotron-3-ultra-550b-a55b:free";
+
 const llm = new ChatOpenAI({
-  model: "openai/gpt-oss-120b:free",
+  model: MODEL,
   apiKey: process.env.OPENROUTER_API_KEY!,
   temperature: 0.1,
   maxRetries: 0,
-  timeout: 90_000,
+  timeout: 180_000,   // 3-minute LangChain-level timeout for large models
   configuration: {
     baseURL: "https://openrouter.ai/api/v1",
     defaultHeaders: {
@@ -42,70 +39,85 @@ const llm = new ChatOpenAI({
   },
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Core helper ──────────────────────────────────────────────────────────────
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /**
- * Invoke the LLM with a hard wall-clock timeout + exponential back-off on 429.
- * A heartbeat callback fires every 20s so the UI stays alive.
+ * Call the LLM with:
+ *  - A hard 180s wall-clock abort (separate from LangChain's own timeout)
+ *  - A visible heartbeat every 25s
+ *  - 429 retry: waits `delayMs` then retries up to `retries` times
  */
-async function llmInvoke(
+async function llmCall(
   messages: (SystemMessage | HumanMessage)[],
-  onHeartbeat?: () => void,
-  retries = 1,
-  delayMs = 10_000
+  opts: {
+    onHeartbeat?: () => void;
+    onRateLimit?: (waitSec: number) => void;
+    retries?: number;
+    delayMs?: number;
+  } = {}
 ): Promise<string> {
-  const TIMEOUT_MS = 90_000;
-  const HEARTBEAT_INTERVAL = 20_000;
+  const { onHeartbeat, onRateLimit, retries = 2, delayMs = 45_000 } = opts;
+  const TIMEOUT = 180_000;
 
-  let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  if (onHeartbeat) {
-    heartbeatTimer = setInterval(onHeartbeat, HEARTBEAT_INTERVAL);
-  }
+  const abort = new AbortController();
+  const abortTimer = setTimeout(() => abort.abort(), TIMEOUT);
 
-  const controller = new AbortController();
-  const wallTimer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  let hb: ReturnType<typeof setInterval> | null = null;
+  if (onHeartbeat) hb = setInterval(onHeartbeat, 25_000);
 
   try {
-    const response = await Promise.race([
+    const res = await Promise.race([
       llm.invoke(messages),
-      new Promise<never>((_, reject) =>
-        controller.signal.addEventListener("abort", () =>
-          reject(new Error("LLM_TIMEOUT"))
+      new Promise<never>((_, rej) =>
+        abort.signal.addEventListener("abort", () =>
+          rej(new Error("LLM_TIMEOUT: model did not respond in 180 s"))
         )
       ),
     ]);
-    return response.content as string;
+    return res.content as string;
   } catch (err: unknown) {
     const msg = String(err);
     if (msg.includes("LLM_TIMEOUT")) throw err;
+
     const is429 =
       msg.includes("429") || msg.includes("RateLimit") ||
-      msg.includes("rate_limit") || msg.includes("capacity");
+      msg.includes("rate_limit") || msg.includes("capacity") ||
+      msg.includes("MODEL_RATE_LIMIT");
+
     if (is429 && retries > 0) {
+      const waitSec = Math.round(delayMs / 1000);
+      onRateLimit?.(waitSec);
       await sleep(delayMs);
-      return llmInvoke(messages, onHeartbeat, retries - 1, delayMs * 2);
+      return llmCall(messages, {
+        onHeartbeat, onRateLimit,
+        retries: retries - 1,
+        delayMs: Math.min(delayMs + 30_000, 120_000),
+      });
     }
     throw err;
   } finally {
-    clearTimeout(wallTimer);
-    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    clearTimeout(abortTimer);
+    if (hb) clearInterval(hb);
   }
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function parseJson(text: string): any {
   try {
-    const cleaned = text.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+    const cleaned = text
+      .replace(/```(?:json)?/gi, "")
+      .replace(/```/g, "")
+      .trim();
     const m = cleaned.match(/\{[\s\S]*\}/);
-    return m ? JSON.parse(m[0]) : {};
+    return m ? JSON.parse(m[0]) : null;
   } catch {
-    return {};
+    return null;
   }
 }
 
-function step(
+function s(
   node: string,
   status: "running" | "complete" | "error",
   message: string,
@@ -114,269 +126,386 @@ function step(
   return { node, status, message, timestamp: Date.now(), data };
 }
 
-// ─── Fallbacks ────────────────────────────────────────────────────────────────
-
-const fallbackNews: NewsAnalysis = {
-  overallSentiment: "neutral", sentimentScore: 0,
-  recentNews: [], keyThemes: [], catalysts: [], concerns: [],
-};
-const fallbackMoat: MoatAnalysis = {
-  moatScore: 50, moatType: [], competitiveAdvantages: [],
-  marketPosition: "N/A", competitorComparison: "N/A",
-  switchingCosts: "N/A", brandStrength: "N/A",
-  networkEffects: "N/A", costAdvantages: "N/A",
-};
-const fallbackRisk: RiskAssessment = {
-  overallRiskLevel: "medium", riskScore: 50,
-  keyRisks: [], redFlags: [],
-  regulatoryRisks: "N/A", competitiveRisks: "N/A",
-  macroRisks: "N/A", financialRisks: "N/A",
-};
-
 // ─── NODE 1: Company Resolver ─────────────────────────────────────────────────
 
 export async function companyResolverNode(
   state: AgentState,
-  onStep: (s: AgentStep) => void
+  emit: (step: AgentStep) => void
 ): Promise<Partial<AgentState>> {
-  onStep(step("companyResolver", "running", `Identifying "${state.companyQuery}"…`));
+  emit(s("companyResolver", "running", `Identifying "${state.companyQuery}"…`));
 
   try {
-    const searchResult = await searchWeb.invoke({
-      query: `${state.companyQuery} stock ticker exchange sector site:finance.yahoo.com OR site:nasdaq.com`,
+    const search = await searchWeb.invoke({
+      query: `${state.companyQuery} stock ticker symbol exchange`,
       maxResults: 3,
     });
 
-    const content = await llmInvoke(
+    const raw = await llmCall(
       [
         new SystemMessage(
-          'Return ONLY this JSON, no markdown:\n' +
-          '{"name":"","ticker":"","sector":"","industry":"","description":"","marketCap":"","founded":"","headquarters":"","website":"","exchange":""}'
+          "Return ONLY a JSON object, no markdown:\n" +
+          '{"name":"","ticker":"","sector":"","industry":"","description":"1 sentence max","marketCap":"","headquarters":"","exchange":""}'
         ),
-        new HumanMessage(`Query:"${state.companyQuery}"\n${searchResult}\nJSON:`),
+        new HumanMessage(`"${state.companyQuery}"\n${search.slice(0, 1200)}`),
       ],
-      () => onStep(step("companyResolver", "running", "Still identifying company…"))
+      {
+        onHeartbeat: () => emit(s("companyResolver", "running", "Model is working…")),
+        onRateLimit: (sec) => emit(s("companyResolver", "running", `Rate limited — retrying in ${sec}s…`)),
+      }
     );
 
-    const companyInfo = parseJson(content) as CompanyInfo;
-    if (!companyInfo?.ticker) throw new Error(`Could not identify "${state.companyQuery}"`);
+    const companyInfo = parseJson(raw) as CompanyInfo | null;
+    if (!companyInfo?.ticker) {
+      throw new Error(`Could not identify "${state.companyQuery}". Try using the ticker directly, e.g. AAPL.`);
+    }
 
-    onStep(step("companyResolver", "complete",
+    emit(s("companyResolver", "complete",
       `✓ ${companyInfo.name} (${companyInfo.ticker}) · ${companyInfo.exchange}`,
       { company: companyInfo }
     ));
     return { companyInfo };
   } catch (err) {
-    onStep(step("companyResolver", "error", `Failed: ${String(err)}`));
+    const msg = String(err);
+    emit(s("companyResolver", "error",
+      msg.includes("LLM_TIMEOUT")
+        ? "Model timed out. The AI is overloaded — please try again."
+        : `Failed: ${msg}`
+    ));
     throw err;
   }
 }
 
-// ─── NODE 2: Combined Research (financials + news + moat + risk in ONE call) ──
+// ─── NODE 2: Financials + News ────────────────────────────────────────────────
 
-export async function combinedResearchNode(
+export async function financialNewsNode(
   state: AgentState,
-  onStep: (s: AgentStep) => void
+  emit: (step: AgentStep) => void
 ): Promise<Partial<AgentState>> {
-  const company = state.companyInfo!;
-  onStep(step("financialAnalyst", "running", `Fetching data for ${company.ticker}…`));
+  const co = state.companyInfo!;
+  emit(s("financialAnalyst", "running", `Fetching financial data for ${co.ticker}…`));
+  emit(s("newsAnalyst", "running", `Scanning news for ${co.name}…`));
 
-  // All data fetches run IN PARALLEL — zero extra wait time
-  const [overview, quote, newsAndMoat] = await Promise.allSettled([
-    getCompanyOverview.invoke({ ticker: company.ticker }),
-    getStockQuote.invoke({ ticker: company.ticker }),
+  // External data fetches run in parallel
+  const [overview, quote, news] = await Promise.allSettled([
+    getCompanyOverview.invoke({ ticker: co.ticker }),
+    getStockQuote.invoke({ ticker: co.ticker }),
     searchWeb.invoke({
-      query: `${company.name} news earnings competitive advantage 2025`,
-      maxResults: 5,
+      query: `${co.name} ${co.ticker} earnings revenue news analyst 2025`,
+      maxResults: 4,
     }),
   ]);
 
-  const overviewText  = overview.status  === "fulfilled" ? overview.value  : "Unavailable";
-  const quoteText     = quote.status     === "fulfilled" ? quote.value     : "Unavailable";
-  const newsText      = newsAndMoat.status === "fulfilled" ? newsAndMoat.value : "Unavailable";
+  const financialRaw = [
+    overview.status === "fulfilled" ? overview.value : "",
+    quote.status    === "fulfilled" ? quote.value    : "",
+  ].join("\n").slice(0, 2200);
 
-  onStep(step("financialAnalyst",  "complete", "Market data fetched ✓"));
-  onStep(step("newsAnalyst",       "running",  "Analysing news & sentiment…"));
-  onStep(step("moatAnalyzer",      "running",  "Scoring competitive moat…"));
-  onStep(step("riskAssessor",      "running",  "Assessing risk profile…"));
-  onStep(step("financialAnalyst",  "running",  "Analysing financials with AI…"));
+  const newsRaw = (news.status === "fulfilled" ? news.value : "").slice(0, 1400);
 
-  // ONE LLM call returns all four sections
-  let content = "";
-  try {
-    content = await llmInvoke(
-      [
-        new SystemMessage(
-          `You are an elite investment analyst. Given company data, return ONLY this JSON structure (no markdown, no explanation):
+  emit(s("financialAnalyst", "running", "AI analysing financials and news…"));
+  emit(s("newsAnalyst",      "running", "AI scoring sentiment…"));
+
+  const SYSTEM = `You are a senior equity analyst. Based on the data provided, return ONLY this JSON object with no markdown, no explanation, just pure JSON:
 {
   "financials": {
-    "currentPrice": null, "peRatio": null, "pbRatio": null, "psRatio": null,
-    "revenueGrowth": null, "grossMargin": null, "operatingMargin": null, "netMargin": null,
-    "roe": null, "debtToEquity": null, "freeCashFlow": null, "dividendYield": null,
-    "fiftyTwoWeekHigh": null, "fiftyTwoWeekLow": null, "analystTargetPrice": null, "eps": null
+    "currentPrice": null,
+    "peRatio": null,
+    "pbRatio": null,
+    "revenueGrowth": null,
+    "grossMargin": null,
+    "netMargin": null,
+    "roe": null,
+    "debtToEquity": null,
+    "freeCashFlow": null,
+    "fiftyTwoWeekHigh": null,
+    "fiftyTwoWeekLow": null,
+    "analystTargetPrice": null,
+    "eps": null
   },
   "news": {
-    "overallSentiment": "neutral", "sentimentScore": 0.0,
-    "recentNews": [{"title": "", "summary": "", "sentiment": "neutral", "date": ""}],
-    "keyThemes": [], "catalysts": [], "concerns": []
-  },
-  "moat": {
-    "moatScore": 50, "moatType": [],
-    "competitiveAdvantages": [], "marketPosition": "",
-    "competitorComparison": "", "switchingCosts": "",
-    "brandStrength": "", "networkEffects": "", "costAdvantages": ""
-  },
-  "risk": {
-    "overallRiskLevel": "medium", "riskScore": 50,
-    "keyRisks": [], "redFlags": [],
-    "regulatoryRisks": "", "competitiveRisks": "", "macroRisks": "", "financialRisks": ""
+    "overallSentiment": "neutral",
+    "sentimentScore": 0.0,
+    "recentNews": [
+      {"title": "example headline", "summary": "brief summary", "sentiment": "neutral", "date": "2025"}
+    ],
+    "keyThemes": ["theme1"],
+    "catalysts": ["catalyst1"],
+    "concerns": ["concern1"]
   }
 }
-Rules: moatScore 0-100 (higher=wider moat). sentimentScore -1 to 1. riskScore 0-100 (higher=riskier). overallRiskLevel: low|medium|high|very-high. Max 4 recentNews items.`
-        ),
+Fill ALL fields using the data. sentimentScore: float -1.0 (very negative) to 1.0 (very positive). Max 3 recentNews items.`;
+
+  let raw = "";
+  try {
+    raw = await llmCall(
+      [
+        new SystemMessage(SYSTEM),
         new HumanMessage(
-          `Company: ${company.name} (${company.ticker}) | Sector: ${company.sector}\n` +
-          `FINANCIALS:\n${overviewText}\nQUOTE:\n${quoteText}\n` +
-          `NEWS/COMPETITIVE:\n${newsText}\n` +
-          `Return the JSON now:`
+          `Company: ${co.name} (${co.ticker}) | ${co.sector}\n\nFINANCIAL DATA:\n${financialRaw}\n\nNEWS:\n${newsRaw}\n\nReturn the JSON:`
         ),
       ],
-      () => {
-        onStep(step("financialAnalyst", "running", "AI still processing data…"));
-        onStep(step("newsAnalyst",      "running", "AI still processing data…"));
-        onStep(step("moatAnalyzer",     "running", "AI still processing data…"));
-        onStep(step("riskAssessor",     "running", "AI still processing data…"));
+      {
+        onHeartbeat: () => {
+          emit(s("financialAnalyst", "running", "Model still generating financials…"));
+          emit(s("newsAnalyst",      "running", "Model still generating news analysis…"));
+        },
+        onRateLimit: (sec) => {
+          emit(s("financialAnalyst", "running", `Rate limited — retrying in ${sec}s…`));
+          emit(s("newsAnalyst",      "running", `Rate limited — retrying in ${sec}s…`));
+        },
       }
     );
   } catch (err) {
     const msg = String(err);
     const isTimeout = msg.includes("LLM_TIMEOUT");
-    const label = isTimeout ? "Timed out — using defaults" : `Error: ${msg}`;
-    onStep(step("financialAnalyst", isTimeout ? "complete" : "error", label));
-    onStep(step("newsAnalyst",      isTimeout ? "complete" : "error", label));
-    onStep(step("moatAnalyzer",     isTimeout ? "complete" : "error", label));
-    onStep(step("riskAssessor",     isTimeout ? "complete" : "error", label));
-    return {
-      financialMetrics: {} as FinancialMetrics,
-      newsAnalysis: fallbackNews,
-      moatAnalysis: fallbackMoat,
-      riskAssessment: fallbackRisk,
-      rawFinancialData: overviewText,
-      rawNewsData: newsText,
-    };
+    const label = isTimeout
+      ? "Model timed out — please retry the research"
+      : `Error: ${msg}`;
+    emit(s("financialAnalyst", "error", label));
+    emit(s("newsAnalyst",      "error", label));
+    throw new Error(`Financial/news analysis failed: ${isTimeout ? "model timed out" : msg}`);
   }
 
-  const parsed = parseJson(content);
+  const parsed = parseJson(raw);
+  if (!parsed?.financials && !parsed?.news) {
+    emit(s("financialAnalyst", "error", "AI returned invalid data — please retry"));
+    emit(s("newsAnalyst",      "error", "AI returned invalid data — please retry"));
+    throw new Error("AI returned unparseable response for financials/news. Please retry.");
+  }
 
   const financialMetrics: FinancialMetrics = parsed.financials ?? {};
-  const newsAnalysis: NewsAnalysis         = { ...fallbackNews,  ...(parsed.news  ?? {}) };
-  const moatAnalysis: MoatAnalysis         = { ...fallbackMoat,  ...(parsed.moat  ?? {}) };
-  const riskAssessment: RiskAssessment     = { ...fallbackRisk,  ...(parsed.risk  ?? {}) };
+  const newsAnalysis: NewsAnalysis = {
+    overallSentiment: parsed.news?.overallSentiment ?? "neutral",
+    sentimentScore:   parsed.news?.sentimentScore   ?? 0,
+    recentNews:       parsed.news?.recentNews       ?? [],
+    keyThemes:        parsed.news?.keyThemes        ?? [],
+    catalysts:        parsed.news?.catalysts        ?? [],
+    concerns:         parsed.news?.concerns         ?? [],
+  };
 
-  onStep(step("financialAnalyst", "complete",
-    `P/E: ${financialMetrics.peRatio ?? "N/A"} · Margin: ${financialMetrics.netMargin ?? "N/A"}`,
+  emit(s("financialAnalyst", "complete",
+    `P/E: ${financialMetrics.peRatio ?? "N/A"} · Net Margin: ${financialMetrics.netMargin ?? "N/A"}`,
     { metrics: financialMetrics }
   ));
-  onStep(step("newsAnalyst", "complete",
-    `Sentiment: ${String(newsAnalysis.overallSentiment).toUpperCase()} (${(newsAnalysis.sentimentScore ?? 0).toFixed(2)})`,
+  emit(s("newsAnalyst", "complete",
+    `Sentiment: ${String(newsAnalysis.overallSentiment).toUpperCase()} (score: ${Number(newsAnalysis.sentimentScore).toFixed(2)})`,
     { sentiment: newsAnalysis.overallSentiment }
   ));
-  onStep(step("moatAnalyzer", "complete",
-    `Moat: ${moatAnalysis.moatScore}/100 · ${moatAnalysis.moatType?.join(", ") || "N/A"}`,
+
+  return { financialMetrics, newsAnalysis, rawFinancialData: financialRaw, rawNewsData: newsRaw };
+}
+
+// ─── NODE 3: Moat + Risk ─────────────────────────────────────────────────────
+
+export async function moatRiskNode(
+  state: AgentState,
+  emit: (step: AgentStep) => void
+): Promise<Partial<AgentState>> {
+  const co = state.companyInfo!;
+  emit(s("moatAnalyzer", "running", `Researching competitive moat for ${co.name}…`));
+  emit(s("riskAssessor", "running", "Evaluating investment risks…"));
+
+  const moatSearch = await searchWeb.invoke({
+    query: `${co.name} competitive advantage moat market share vs competitors 2025`,
+    maxResults: 4,
+  }).catch(() => "");
+
+  emit(s("moatAnalyzer", "running", "AI scoring moat and risks…"));
+  emit(s("riskAssessor", "running", "AI scoring moat and risks…"));
+
+  const SYSTEM = `You are a Morningstar-style moat analyst and risk manager. Based on the data, return ONLY this JSON with no markdown:
+{
+  "moat": {
+    "moatScore": 60,
+    "moatType": ["switching costs"],
+    "competitiveAdvantages": ["advantage1", "advantage2"],
+    "marketPosition": "describe market position",
+    "competitorComparison": "how it compares to competitors",
+    "switchingCosts": "describe switching costs",
+    "brandStrength": "describe brand strength",
+    "networkEffects": "describe network effects",
+    "costAdvantages": "describe cost advantages"
+  },
+  "risk": {
+    "overallRiskLevel": "medium",
+    "riskScore": 45,
+    "keyRisks": ["risk1", "risk2", "risk3"],
+    "redFlags": ["flag1"],
+    "regulatoryRisks": "describe regulatory risks",
+    "competitiveRisks": "describe competitive risks",
+    "macroRisks": "describe macro risks",
+    "financialRisks": "describe financial risks"
+  }
+}
+moatScore: 0-100 (higher = stronger moat). moatType options: network effects, cost advantage, switching costs, intangible assets, efficient scale, none.
+overallRiskLevel: low | medium | high | very-high. riskScore: 0-100 (higher = riskier).`;
+
+  let raw = "";
+  try {
+    raw = await llmCall(
+      [
+        new SystemMessage(SYSTEM),
+        new HumanMessage(
+          `Company: ${co.name} (${co.ticker}) | ${co.sector} / ${co.industry}\n\n` +
+          `Financials snapshot: P/E=${state.financialMetrics?.peRatio ?? "N/A"}, ` +
+          `netMargin=${state.financialMetrics?.netMargin ?? "N/A"}, ` +
+          `debtToEquity=${state.financialMetrics?.debtToEquity ?? "N/A"}\n` +
+          `News sentiment: ${state.newsAnalysis?.overallSentiment ?? "N/A"} ` +
+          `(score=${state.newsAnalysis?.sentimentScore ?? 0})\n` +
+          `Concerns: ${JSON.stringify(state.newsAnalysis?.concerns ?? [])}\n\n` +
+          `COMPETITIVE RESEARCH:\n${moatSearch.slice(0, 1800)}\n\nReturn the JSON:`
+        ),
+      ],
+      {
+        onHeartbeat: () => {
+          emit(s("moatAnalyzer", "running", "Model still analysing moat…"));
+          emit(s("riskAssessor", "running", "Model still assessing risks…"));
+        },
+        onRateLimit: (sec) => {
+          emit(s("moatAnalyzer", "running", `Rate limited — retrying in ${sec}s…`));
+          emit(s("riskAssessor", "running", `Rate limited — retrying in ${sec}s…`));
+        },
+      }
+    );
+  } catch (err) {
+    const msg = String(err);
+    const isTimeout = msg.includes("LLM_TIMEOUT");
+    const label = isTimeout ? "Model timed out — please retry" : `Error: ${msg}`;
+    emit(s("moatAnalyzer", "error", label));
+    emit(s("riskAssessor", "error", label));
+    throw new Error(`Moat/risk analysis failed: ${isTimeout ? "model timed out" : msg}`);
+  }
+
+  const parsed = parseJson(raw);
+  if (!parsed?.moat && !parsed?.risk) {
+    emit(s("moatAnalyzer", "error", "AI returned invalid data — please retry"));
+    emit(s("riskAssessor", "error", "AI returned invalid data — please retry"));
+    throw new Error("AI returned unparseable response for moat/risk. Please retry.");
+  }
+
+  const moatAnalysis: MoatAnalysis = {
+    moatScore:            parsed.moat?.moatScore            ?? 50,
+    moatType:             parsed.moat?.moatType             ?? [],
+    competitiveAdvantages: parsed.moat?.competitiveAdvantages ?? [],
+    marketPosition:       parsed.moat?.marketPosition       ?? "",
+    competitorComparison: parsed.moat?.competitorComparison ?? "",
+    switchingCosts:       parsed.moat?.switchingCosts       ?? "",
+    brandStrength:        parsed.moat?.brandStrength        ?? "",
+    networkEffects:       parsed.moat?.networkEffects       ?? "",
+    costAdvantages:       parsed.moat?.costAdvantages       ?? "",
+  };
+
+  const riskAssessment: RiskAssessment = {
+    overallRiskLevel: parsed.risk?.overallRiskLevel ?? "medium",
+    riskScore:        parsed.risk?.riskScore        ?? 50,
+    keyRisks:         parsed.risk?.keyRisks         ?? [],
+    redFlags:         parsed.risk?.redFlags         ?? [],
+    regulatoryRisks:  parsed.risk?.regulatoryRisks  ?? "",
+    competitiveRisks: parsed.risk?.competitiveRisks ?? "",
+    macroRisks:       parsed.risk?.macroRisks       ?? "",
+    financialRisks:   parsed.risk?.financialRisks   ?? "",
+  };
+
+  emit(s("moatAnalyzer", "complete",
+    `Moat: ${moatAnalysis.moatScore}/100 · ${moatAnalysis.moatType.join(", ") || "N/A"}`,
     { score: moatAnalysis.moatScore }
   ));
-  onStep(step("riskAssessor", "complete",
+  emit(s("riskAssessor", "complete",
     `Risk: ${String(riskAssessment.overallRiskLevel).toUpperCase()} (${riskAssessment.riskScore}/100)`,
     { riskLevel: riskAssessment.overallRiskLevel }
   ));
 
-  return {
-    financialMetrics,
-    newsAnalysis,
-    moatAnalysis,
-    riskAssessment,
-    rawFinancialData: overviewText,
-    rawNewsData: newsText,
-  };
+  return { moatAnalysis, riskAssessment };
 }
 
-// ─── NODE 3: Decision Maker ───────────────────────────────────────────────────
+// ─── NODE 4: Decision Maker ───────────────────────────────────────────────────
 
 export async function decisionMakerNode(
   state: AgentState,
-  onStep: (s: AgentStep) => void
+  emit: (step: AgentStep) => void
 ): Promise<Partial<AgentState>> {
-  onStep(step("decisionMaker", "running", "Synthesising final investment decision…"));
+  emit(s("decisionMaker", "running", "Synthesising final investment decision…"));
 
-  let content = "";
+  const SYSTEM = `You are a Chief Investment Officer making a final investment decision. You MUST base your verdict entirely on the research data provided.
+Return ONLY this JSON with no markdown:
+{
+  "verdict": "INVEST",
+  "confidence": 72,
+  "targetHorizon": "medium-term",
+  "overallScore": 68,
+  "scores": {
+    "financialHealth": 70,
+    "growthPotential": 75,
+    "competitiveMoat": 65,
+    "managementQuality": 70,
+    "valuationFairness": 60,
+    "sentimentMomentum": 68
+  },
+  "reasoning": "2-3 sentence explanation grounded in the data",
+  "bullCase": ["specific bull point 1", "specific bull point 2", "specific bull point 3"],
+  "bearCase": ["specific bear point 1", "specific bear point 2"],
+  "keyWatchPoints": ["what to monitor 1", "what to monitor 2"],
+  "riskRewardRating": "Favorable",
+  "suggestedWeight": "3-5%"
+}
+verdict: INVEST (strong opportunity) | PASS (avoid) | WATCH (wait for catalyst).
+riskRewardRating: Favorable | Neutral | Unfavorable.
+All scores are 0-100. Be specific — do not use generic phrases.`;
+
+  let raw = "";
   try {
-    content = await llmInvoke(
+    raw = await llmCall(
       [
-        new SystemMessage(
-          'CIO-level decision. Return ONLY this JSON (no markdown):\n' +
-          '{"verdict":"INVEST|PASS|WATCH","confidence":70,"targetHorizon":"medium-term","overallScore":60,' +
-          '"scores":{"financialHealth":60,"growthPotential":60,"competitiveMoat":60,"managementQuality":60,"valuationFairness":60,"sentimentMomentum":60},' +
-          '"reasoning":"","bullCase":[""],"bearCase":[""],"keyWatchPoints":[""],' +
-          '"riskRewardRating":"Neutral","suggestedWeight":"2-3%"}\n' +
-          'verdict: INVEST=strong buy | PASS=avoid | WATCH=wait for catalyst'
-        ),
+        new SystemMessage(SYSTEM),
         new HumanMessage(
-          `${state.companyInfo!.name} (${state.companyInfo!.ticker}) — ${state.companyInfo!.sector}\n` +
-          `P/E=${state.financialMetrics?.peRatio ?? "N/A"} · margin=${state.financialMetrics?.netMargin ?? "N/A"} · growth=${state.financialMetrics?.revenueGrowth ?? "N/A"} · D/E=${state.financialMetrics?.debtToEquity ?? "N/A"}\n` +
-          `Sentiment: ${state.newsAnalysis?.overallSentiment} (${state.newsAnalysis?.sentimentScore})\n` +
-          `Moat: ${state.moatAnalysis?.moatScore}/100 · ${JSON.stringify(state.moatAnalysis?.moatType)}\n` +
-          `Risk: ${state.riskAssessment?.overallRiskLevel} (${state.riskAssessment?.riskScore}/100)\n` +
-          `Red flags: ${JSON.stringify(state.riskAssessment?.redFlags)}\n` +
-          `Catalysts: ${JSON.stringify(state.newsAnalysis?.catalysts)}\n` +
-          `Return JSON:`
+          `=== RESEARCH DOSSIER: ${state.companyInfo!.name} (${state.companyInfo!.ticker}) ===\n` +
+          `Sector: ${state.companyInfo!.sector} / ${state.companyInfo!.industry}\n\n` +
+          `FINANCIALS:\n` +
+          `  Price: $${state.financialMetrics?.currentPrice ?? "N/A"}\n` +
+          `  P/E: ${state.financialMetrics?.peRatio ?? "N/A"}\n` +
+          `  Net Margin: ${state.financialMetrics?.netMargin ?? "N/A"}\n` +
+          `  Revenue Growth: ${state.financialMetrics?.revenueGrowth ?? "N/A"}\n` +
+          `  ROE: ${state.financialMetrics?.roe ?? "N/A"}\n` +
+          `  Debt/Equity: ${state.financialMetrics?.debtToEquity ?? "N/A"}\n` +
+          `  Free Cash Flow: ${state.financialMetrics?.freeCashFlow ?? "N/A"}\n` +
+          `  52-wk High: $${state.financialMetrics?.fiftyTwoWeekHigh ?? "N/A"} | Low: $${state.financialMetrics?.fiftyTwoWeekLow ?? "N/A"}\n\n` +
+          `NEWS SENTIMENT: ${state.newsAnalysis?.overallSentiment} (score: ${state.newsAnalysis?.sentimentScore})\n` +
+          `  Catalysts: ${JSON.stringify(state.newsAnalysis?.catalysts)}\n` +
+          `  Concerns: ${JSON.stringify(state.newsAnalysis?.concerns)}\n` +
+          `  Key Themes: ${JSON.stringify(state.newsAnalysis?.keyThemes)}\n\n` +
+          `COMPETITIVE MOAT: ${state.moatAnalysis?.moatScore}/100\n` +
+          `  Type: ${JSON.stringify(state.moatAnalysis?.moatType)}\n` +
+          `  Advantages: ${JSON.stringify(state.moatAnalysis?.competitiveAdvantages)}\n` +
+          `  Market Position: ${state.moatAnalysis?.marketPosition}\n\n` +
+          `RISK: ${state.riskAssessment?.overallRiskLevel} (${state.riskAssessment?.riskScore}/100)\n` +
+          `  Key Risks: ${JSON.stringify(state.riskAssessment?.keyRisks)}\n` +
+          `  Red Flags: ${JSON.stringify(state.riskAssessment?.redFlags)}\n\n` +
+          `Return your investment decision JSON now:`
         ),
       ],
-      () => onStep(step("decisionMaker", "running", "AI deliberating on verdict…"))
+      {
+        onHeartbeat: () => emit(s("decisionMaker", "running", "AI deliberating on verdict…")),
+        onRateLimit: (sec) => emit(s("decisionMaker", "running", `Rate limited — retrying in ${sec}s…`)),
+      }
     );
-  } catch {
-    // Auto-calculate verdict from available scores if LLM fails
+  } catch (err) {
+    const msg = String(err);
+    const isTimeout = msg.includes("LLM_TIMEOUT");
+    emit(s("decisionMaker", "error",
+      isTimeout ? "Model timed out on decision — please retry" : `Error: ${msg}`
+    ));
+    throw new Error(`Decision failed: ${isTimeout ? "model timed out" : msg}`);
   }
 
-  let decision = parseJson(content) as InvestmentDecision;
-
-  // Auto-calculate fallback if LLM returned empty / timed out
+  const decision = parseJson(raw) as InvestmentDecision | null;
   if (!decision?.verdict) {
-    const moat  = state.moatAnalysis?.moatScore ?? 50;
-    const risk  = state.riskAssessment?.riskScore ?? 50;
-    const sent  = ((state.newsAnalysis?.sentimentScore ?? 0) + 1) * 50;
-    const score = Math.round((moat + (100 - risk) + sent) / 3);
-    const verdict: InvestmentDecision["verdict"] =
-      score >= 65 ? "INVEST" : score >= 45 ? "WATCH" : "PASS";
-
-    decision = {
-      verdict,
-      confidence: 45,
-      targetHorizon: "medium-term",
-      overallScore: score,
-      scores: {
-        financialHealth: 50, growthPotential: moat,
-        competitiveMoat: moat, managementQuality: 50,
-        valuationFairness: 50, sentimentMomentum: Math.round(sent),
-      },
-      reasoning: `Auto-calculated from available data. Moat: ${moat}/100, Risk: ${risk}/100, Sentiment: ${(state.newsAnalysis?.sentimentScore ?? 0).toFixed(2)}.`,
-      bullCase:        state.newsAnalysis?.catalysts?.slice(0, 3) ?? [],
-      bearCase:        state.riskAssessment?.keyRisks?.slice(0, 2) ?? [],
-      keyWatchPoints:  state.riskAssessment?.keyRisks?.slice(2, 4) ?? [],
-      riskRewardRating: risk < 40 ? "Favorable" : risk > 65 ? "Unfavorable" : "Neutral",
-      suggestedWeight:  verdict === "INVEST" ? "3-5%" : verdict === "WATCH" ? "1-2%" : "Avoid",
-    };
+    emit(s("decisionMaker", "error", "AI returned invalid decision — please retry"));
+    throw new Error("AI did not produce a valid investment decision. Please retry.");
   }
 
-  onStep(step("decisionMaker", "complete",
+  emit(s("decisionMaker", "complete",
     `${decision.verdict} · ${decision.confidence}% confidence · Score ${decision.overallScore}/100`,
     { verdict: decision.verdict, confidence: decision.confidence }
   ));
   return { decision };
 }
-
-// ─── Keep old node exports for graph.ts compatibility ─────────────────────────
-// graph.ts now calls combinedResearchNode instead of the four separate ones.
-export { combinedResearchNode as financialAnalystNode };
-export { combinedResearchNode as newsAnalystNode };
-export { combinedResearchNode as moatAnalyzerNode };
-export { combinedResearchNode as riskAssessorNode };

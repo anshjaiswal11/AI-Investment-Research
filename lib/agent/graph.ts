@@ -1,50 +1,55 @@
 import type { AgentState, AgentStep } from "./state";
 import {
   companyResolverNode,
-  combinedResearchNode,
+  financialNewsNode,
+  moatRiskNode,
   decisionMakerNode,
 } from "./nodes";
 
-/** 3-minute hard ceiling on the entire pipeline. */
-const PIPELINE_TIMEOUT_MS = 180_000;
+const PIPELINE_TIMEOUT_MS = 360_000; // 6 min (4 calls × 90s avg + gaps)
+const GAP_MS = 8_000;               // 8s between LLM calls — avoids back-to-back 429s
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 async function runPipeline(
   companyQuery: string,
   onStep: (step: AgentStep) => void
 ): Promise<AgentState> {
   let state: AgentState = { companyQuery, steps: [] };
-  const add = (s: AgentStep) => { state.steps.push(s); onStep(s); };
+  const add = (step: AgentStep) => { state.steps.push(step); onStep(step); };
 
-  // ── 1. Resolve company (1 search + 1 LLM) ─────────────────────────────────
-  const resolved = await companyResolverNode(state, add);
-  state = { ...state, ...resolved };
+  // 1. Identify company ──────────────────────────────────────────────────────
+  state = { ...state, ...(await companyResolverNode(state, add)) };
+  if (!state.companyInfo) throw new Error("Could not identify company.");
 
-  if (!state.companyInfo) {
-    throw new Error("Could not identify company. Try the official name or ticker symbol.");
-  }
+  await sleep(GAP_MS);
 
-  // ── 2. Combined research (parallel fetches + 1 LLM) ───────────────────────
-  //    Returns: financialMetrics + newsAnalysis + moatAnalysis + riskAssessment
-  const research = await combinedResearchNode(state, add);
-  state = { ...state, ...research };
+  // 2. Financials + News ─────────────────────────────────────────────────────
+  state = { ...state, ...(await financialNewsNode(state, add)) };
 
-  // ── 3. Decision (1 LLM) ───────────────────────────────────────────────────
-  const decision = await decisionMakerNode(state, add);
-  state = { ...state, ...decision };
+  await sleep(GAP_MS);
+
+  // 3. Moat + Risk ───────────────────────────────────────────────────────────
+  state = { ...state, ...(await moatRiskNode(state, add)) };
+
+  await sleep(GAP_MS);
+
+  // 4. Investment Decision ───────────────────────────────────────────────────
+  state = { ...state, ...(await decisionMakerNode(state, add)) };
 
   return state;
 }
 
-/**
- * Public entry-point: wraps the 3-node pipeline with a hard wall-clock timeout.
- */
 export async function runResearchGraph(
   companyQuery: string,
   onStep: (step: AgentStep) => void
 ): Promise<AgentState> {
   const timeout = new Promise<never>((_, reject) =>
     setTimeout(
-      () => reject(new Error(`Research timed out after ${PIPELINE_TIMEOUT_MS / 60_000} minutes. The model may be overloaded — please try again.`)),
+      () => reject(new Error(
+        "Research timed out after 6 minutes. The free-tier model is overloaded right now. " +
+        "Please wait 1–2 minutes and try again."
+      )),
       PIPELINE_TIMEOUT_MS
     )
   );

@@ -3,7 +3,7 @@ import { runResearchGraph } from "@/lib/agent/graph";
 import type { AgentStep } from "@/lib/agent/state";
 
 export const runtime = "nodejs";
-export const maxDuration = 120;
+export const maxDuration = 300;
 
 export async function POST(req: NextRequest) {
   const { company } = await req.json();

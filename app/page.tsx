@@ -293,13 +293,53 @@ export default function HomePage() {
           </div>
         </section>
 
-        {/* Error */}
+        {/* Error Panel */}
         {error && (
-          <div className="error-card">
-            <span className="error-icon">⚠️</span>
-            <div>
-              <div className="error-title">Research Failed</div>
-              <div className="error-message">{error}</div>
+          <div className="error-panel">
+            <div className="error-panel-header">
+              <div className="error-panel-icon">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="10"/>
+                  <line x1="12" y1="8" x2="12" y2="12"/>
+                  <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+              </div>
+              <div>
+                <div className="error-panel-title">Research Could Not Complete</div>
+                <div className="error-panel-subtitle">{error}</div>
+              </div>
+            </div>
+
+            <div className="error-panel-causes">
+              <div className="error-cause-title">Why does this happen?</div>
+              <div className="error-cause-list">
+                <div className="error-cause-item">
+                  <span className="error-cause-dot" style={{background:"#f59e0b"}}/>
+                  <span><strong>Free-tier rate limits</strong> — The model allows only 2–3 requests per minute. Running all 4 research steps can exceed this.</span>
+                </div>
+                <div className="error-cause-item">
+                  <span className="error-cause-dot" style={{background:"#3b82f6"}}/>
+                  <span><strong>Model queue overload</strong> — Large free models (550B+) have shared compute. Peak hours can delay or drop responses.</span>
+                </div>
+                <div className="error-cause-item">
+                  <span className="error-cause-dot" style={{background:"#8b5cf6"}}/>
+                  <span><strong>Response timeout</strong> — The model took longer than 180 seconds to generate the analysis JSON.</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="error-panel-actions">
+              <button
+                className="error-retry-btn"
+                onClick={() => { setError(null); runResearch(query); }}
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <path d="M1 4v6h6"/><path d="M23 20v-6h-6"/>
+                  <path d="M20.49 9A9 9 0 005.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 013.51 15"/>
+                </svg>
+                Try Again
+              </button>
+              <span className="error-tip">Tip: wait 60 seconds before retrying to let the rate limit reset.</span>
             </div>
           </div>
         )}
