@@ -152,10 +152,27 @@ export default function HomePage() {
       <nav className="nav">
         <div className="nav-inner">
           <a href="/" className="nav-logo">
-            <div className="nav-logo-icon">α</div>
-            <span className="nav-logo-text">Alpha<span>Signal</span></span>
+            {/* NexusAI SVG logo */}
+            <svg className="nav-logo-svg" width="34" height="34" viewBox="0 0 34 34" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <linearGradient id="logoGrad" x1="0" y1="0" x2="34" y2="34" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stopColor="#60a5fa"/>
+                  <stop offset="100%" stopColor="#a78bfa"/>
+                </linearGradient>
+              </defs>
+              <rect width="34" height="34" rx="9" fill="url(#logoGrad)" opacity="0.15"/>
+              <rect width="34" height="34" rx="9" stroke="url(#logoGrad)" strokeWidth="1.2"/>
+              {/* N shape */}
+              <path d="M9 24V10l10 14V10" stroke="url(#logoGrad)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+              {/* dot accent */}
+              <circle cx="26" cy="12" r="2.5" fill="#60a5fa"/>
+            </svg>
+            <span className="nav-logo-text">Nexus<span>AI</span></span>
           </a>
-          <span className="nav-badge">AI Research Agent · v1.0</span>
+          <div className="nav-right">
+            <span className="nav-badge">Multi-Agent · LangGraph</span>
+            <span className="nav-status"><span className="nav-status-dot" />Live</span>
+          </div>
         </div>
       </nav>
 
@@ -166,21 +183,56 @@ export default function HomePage() {
       <main className="main-content">
         {/* Hero */}
         <section className="hero">
+          {/* Animated background grid */}
+          <div className="hero-bg" aria-hidden="true">
+            <div className="hero-grid" />
+            <div className="hero-orb hero-orb-1" />
+            <div className="hero-orb hero-orb-2" />
+            <div className="hero-orb hero-orb-3" />
+          </div>
+
+          {/* Floating stat pills */}
+          <div className="hero-stats" aria-hidden="true">
+            <div className="hero-stat-pill hero-stat-pill-1">
+              <span className="hero-stat-icon">📈</span>
+              <span>6 AI Agents</span>
+            </div>
+            <div className="hero-stat-pill hero-stat-pill-2">
+              <span className="hero-stat-icon">⚡</span>
+              <span>Real-time Data</span>
+            </div>
+            <div className="hero-stat-pill hero-stat-pill-3">
+              <span className="hero-stat-icon">🎯</span>
+              <span>INVEST · PASS · WATCH</span>
+            </div>
+          </div>
+
           <div className="hero-eyebrow">
             <span className="hero-eyebrow-dot" />
-            Powered by LangGraph · Gemini 1.5 Pro
+            Powered by LangGraph &amp; OpenRouter
           </div>
 
           <h1 className="hero-title">
-            Institutional-grade<br />
-            <span className="hero-title-highlight">AI Investment Research</span>
+            Your AI-Powered
+            <br />
+            <span className="hero-title-highlight">Investment Research</span>
+            <br />
+            <span className="hero-title-sub">Analyst</span>
           </h1>
 
           <p className="hero-subtitle">
-            Enter any public company. Our multi-agent AI performs deep
-            financial analysis, news sentiment, competitive moat assessment,
-            and delivers a clear <strong>Invest / Pass</strong> decision.
+            Enter any public company. Six specialized AI agents analyse financials,
+            news sentiment, competitive moat, and risk — then deliver a clear
+            institutional-grade <strong>verdict</strong> in minutes.
           </p>
+
+          {/* Trust badges */}
+          <div className="hero-trust">
+            <span className="trust-badge"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="5" stroke="#10b981" strokeWidth="1.5"/><path d="M3.5 6l1.8 1.8L8.5 4.5" stroke="#10b981" strokeWidth="1.5" strokeLinecap="round"/></svg>Financial Data</span>
+            <span className="trust-badge"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="5" stroke="#10b981" strokeWidth="1.5"/><path d="M3.5 6l1.8 1.8L8.5 4.5" stroke="#10b981" strokeWidth="1.5" strokeLinecap="round"/></svg>News Sentiment</span>
+            <span className="trust-badge"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="5" stroke="#10b981" strokeWidth="1.5"/><path d="M3.5 6l1.8 1.8L8.5 4.5" stroke="#10b981" strokeWidth="1.5" strokeLinecap="round"/></svg>Competitive Moat</span>
+            <span className="trust-badge"><svg width="12" height="12" viewBox="0 0 12 12" fill="none"><circle cx="6" cy="6" r="5" stroke="#10b981" strokeWidth="1.5"/><path d="M3.5 6l1.8 1.8L8.5 4.5" stroke="#10b981" strokeWidth="1.5" strokeLinecap="round"/></svg>Risk Assessment</span>
+          </div>
 
           {/* Search form */}
           <div className="search-container">
@@ -196,7 +248,7 @@ export default function HomePage() {
                   type="text"
                   value={query}
                   onChange={e => setQuery(e.target.value)}
-                  placeholder="Company name or ticker (e.g. Apple, TSLA, Nvidia...)"
+                  placeholder="Company name or ticker — e.g. Apple, TSLA, Nvidia…"
                   disabled={isRunning}
                   autoComplete="off"
                   autoFocus
@@ -210,15 +262,14 @@ export default function HomePage() {
                   {isRunning ? (
                     <>
                       <span className="spinner" style={{ width: 14, height: 14, borderWidth: 2 }} />
-                      Researching…
+                      Analysing…
                     </>
                   ) : (
                     <>
-                      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                        <line x1="12" y1="5" x2="12" y2="19" />
-                        <polyline points="19 12 12 19 5 12" />
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                        <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
                       </svg>
-                      Analyze
+                      Run Research
                     </>
                   )}
                 </button>
@@ -226,6 +277,7 @@ export default function HomePage() {
             </form>
 
             <div className="search-suggestions">
+              <span className="suggestions-label">Try:</span>
               {SUGGESTIONS.map(s => (
                 <button
                   key={s}

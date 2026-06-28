@@ -2,12 +2,12 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "AlphaSignal — AI Investment Research Agent",
+  title: "NexusAI — Institutional Investment Research Agent",
   description:
-    "Institutional-grade AI investment research. Enter any company name and receive a comprehensive invest/pass decision powered by multi-agent analysis.",
-  keywords: ["investment research", "AI", "stock analysis", "financial research", "LLM"],
+    "AI-powered investment research platform. Enter any public company and receive an institutional-grade Invest / Pass decision powered by multi-agent LangGraph analysis.",
+  keywords: ["investment research", "AI", "stock analysis", "financial research", "LangGraph", "LLM"],
   openGraph: {
-    title: "AlphaSignal — AI Investment Research Agent",
+    title: "NexusAI — Institutional Investment Research Agent",
     description: "Institutional-grade AI investment research powered by multi-agent LangGraph analysis.",
     type: "website",
   },
