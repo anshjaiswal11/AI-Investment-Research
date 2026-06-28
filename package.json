@@ -27,5 +27,9 @@
     "recharts": "^3.9.0",
     "typescript": "^6.0.3",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^14.2.35"
   }
 }
